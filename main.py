@@ -1,4 +1,5 @@
-from langchain.document_loaders import OnlinePDFLoader
+import streamlit as st
+from langchain.document_loaders import PyPDFLoader
 from langchain.vectorstores import Chroma
 from langchain.embeddings import GPT4AllEmbeddings
 from langchain import PromptTemplate
@@ -6,43 +7,57 @@ from langchain.llms import Ollama
 from langchain.callbacks.manager import CallbackManager
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
 from langchain.chains import RetrievalQA
-from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-import sys
+import tempfile
 import os
 
-class SuppressStdout:
-    def __enter__(self):
-        self._original_stdout = sys.stdout
-        self._original_stderr = sys.stderr
-        sys.stdout = open(os.devnull, 'w')
-        sys.stderr = open(os.devnull, 'w')
+# Streamlit app
+st.title("Chat with Your PDF using Ollama")
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        sys.stdout.close()
-        sys.stdout = self._original_stdout
-        sys.stderr = self._original_stderr
+# Sidebar for customization
+st.sidebar.header("Customization")
+chunk_size = st.sidebar.slider("Chunk Size", min_value=100, max_value=1000, value=500, step=100)
+chunk_overlap = st.sidebar.slider("Chunk Overlap", min_value=0, max_value=100, value=0, step=10)
+ollama_model = st.sidebar.selectbox("Ollama Model", ["llama3.2:1b", "llama3.2:7b", "llama3.2:13b"])
 
-# load the pdf and split it into chunks
-loader = PyPDFLoader("data/profile.pdf")
-# loader = PyPDFLoader("data/ai_adoption_framework_whitepaper.pdf")
-# loader = OnlinePDFLoader("https://d18rn0p25nwr6d.cloudfront.net/CIK-0001813756/975b3e9b-268e-4798-a9e4-2a9a7c92dc10.pdf")
-data = loader.load()
+# File uploader
+uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
 
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=0)
-all_splits = text_splitter.split_documents(data)
+# Initialize session state
+if 'vectorstore' not in st.session_state:
+    st.session_state.vectorstore = None
 
-with SuppressStdout():
-    vectorstore = Chroma.from_documents(documents=all_splits, embedding=GPT4AllEmbeddings())
+if uploaded_file is not None:
+    try:
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_file_path = tmp_file.name
 
-while True:
-    query = input("\nQuery: ")
-    if query == "exit":
-        break
-    if query.strip() == "":
-        continue
+        # Load and process the PDF
+        loader = PyPDFLoader(tmp_file_path)
+        data = loader.load()
 
+        # Split the document into chunks
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        all_splits = text_splitter.split_documents(data)
+
+        # Create and store the vectorstore
+        st.session_state.vectorstore = Chroma.from_documents(documents=all_splits, embedding=GPT4AllEmbeddings())
+
+        # Remove temporary file
+        os.unlink(tmp_file_path)
+
+        st.success("File processed successfully!")
+    except Exception as e:
+        st.error(f"An error occurred while processing the file: {str(e)}")
+
+# Query input
+query = st.text_input("Ask a question about your document:")
+submit_button = st.button("Submit")
+
+if submit_button and query and st.session_state.vectorstore:
     # Prompt
     template = """Use the following pieces of context to answer the question at the end.
     If you don't know the answer, just say that you don't know, don't try to make up an answer.
@@ -55,11 +70,29 @@ while True:
         template=template,
     )
 
-    llm = Ollama(model="llama3.2:1b", callback_manager=CallbackManager([StreamingStdOutCallbackHandler()]))
+    class StreamHandler(StreamingStdOutCallbackHandler):
+        def __init__(self, container, initial_text=""):
+            self.container = container
+            self.text = initial_text
+
+        def on_llm_new_token(self, token: str, **kwargs) -> None:
+            self.text += token
+            self.container.markdown(self.text)
+
+    stream_handler = StreamHandler(st.empty())
+    llm = Ollama(model=ollama_model, callback_manager=CallbackManager([stream_handler]))
+    
     qa_chain = RetrievalQA.from_chain_type(
         llm,
-        retriever=vectorstore.as_retriever(),
+        retriever=st.session_state.vectorstore.as_retriever(),
         chain_type_kwargs={"prompt": QA_CHAIN_PROMPT},
     )
 
-    result = qa_chain({"query": query})
+    try:
+        with st.spinner("Generating response..."):
+            result = qa_chain({"query": query})
+    except Exception as e:
+        st.error(f"An error occurred while generating the response: {str(e)}")
+
+elif submit_button and not st.session_state.vectorstore:
+    st.warning("Please upload a PDF file first.")
